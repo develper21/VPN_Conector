@@ -2,3 +2,4 @@ logs*
 __pycache__*
 certificates*
 config
+venv
