@@ -1,11 +1,11 @@
 """
 Security Module for VPN
 
-This package provides security-related functionality for the VPN, including
-encryption, key exchange, and certificate management.
+This package provides security-related functionality for VPN, including
+encryption, key exchange, certificate management, and security auditing.
 """
 
-# Import key components to make them available at the package level
+# Import key components to make them available at package level
 from .encryption import (
     EncryptionManager,
     CipherAlgorithm,
@@ -27,6 +27,11 @@ from .certificate_manager import (
     generate_csr,
     sign_certificate
 )
+from .security_auditing import (
+    SecurityAuditor,
+    VulnerabilityFinding,
+    SecurityScore
+)
 
 # Define what gets imported with 'from security import *'
 __all__ = [
@@ -44,8 +49,11 @@ __all__ = [
     'CertificateError',
     'generate_self_signed_cert',
     'generate_csr',
-    'sign_certificate'
+    'sign_certificate',
+    'SecurityAuditor',
+    'VulnerabilityFinding',
+    'SecurityScore'
 ]
 
 # Package version
-__version__ = '0.1.0'
+__version__ = '1.0.0'
