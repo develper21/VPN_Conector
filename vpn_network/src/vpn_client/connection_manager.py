@@ -5,27 +5,67 @@ This module handles the management of connections to the VPN server, including
 connection pooling, reconnection logic, and connection state management.
 """
 import os
+import sys
 import time
 import socket
 import select
 import logging
 import random
 import threading
+import asyncio
+import subprocess
+import platform
+import statistics
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable, Set
 from enum import Enum, auto
+from collections import deque, defaultdict
+from pathlib import Path
+
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.logger import LoggableMixin
 from utils.validator import validate_ip_address, validate_port
 from network.interface import UDPSocket, NetworkError
+from discovery import (
+    AdvancedLoadBalancer, LoadBalanceAlgorithm, VPNServer, ServerStatus,
+    FailoverManager, FailoverTrigger
+)
+from discovery.server_registry import ServerRegistry
+from discovery.health_checker import HealthChecker
 
 class ConnectionState(Enum):
-    """Represents the state of a connection."""
+    """Represents state of a connection."""
     DISCONNECTED = auto()
     CONNECTING = auto()
     CONNECTED = auto()
     DISCONNECTING = auto()
     ERROR = auto()
+    RECONNECTING = auto()
+    SWITCHING_SERVER = auto()
+    FAILED = auto()
+    SUSPENDED = auto()
+
+class NetworkStatus(Enum):
+    """Network status enumeration."""
+    UNKNOWN = auto()
+    HEALTHY = auto()
+    DEGRADED = auto()
+    UNSTABLE = auto()
+    OFFLINE = auto()
+
+class FailureType(Enum):
+    """Types of connection failures."""
+    NETWORK_UNREACHABLE = auto()
+    DNS_FAILURE = auto()
+    SERVER_UNREACHABLE = auto()
+    AUTHENTICATION_FAILURE = auto()
+    PROTOCOL_ERROR = auto()
+    TIMEOUT = auto()
+    CONNECTION_RESET = auto()
+    QUALITY_DEGRADED = auto()
+    MANUAL_DISCONNECT = auto()
 
 @dataclass
 class ConnectionStats:
@@ -39,6 +79,77 @@ class ConnectionStats:
     last_activity: Optional[float] = None
     errors: int = 0
     reconnects: int = 0
+    
+    # Enhanced resilience stats
+    uptime: float = 0.0
+    quality_score: float = 0.0
+    latency_ms: float = 0.0
+    packet_loss: float = 0.0
+    server_switches: int = 0
+    network_failures: int = 0
+    
+    def update_uptime(self):
+        """Update uptime based on current time."""
+        if self.connect_time and self.connect_time > 0:
+            self.uptime = time.time() - self.connect_time
+
+@dataclass
+class ConnectionMetrics:
+    """Connection quality metrics."""
+    timestamp: float
+    latency_ms: float
+    packet_loss: float
+    jitter_ms: float
+    bandwidth_mbps: float
+    connection_stability: float  # 0-1 scale
+    error_rate: float
+    uptime_percentage: float
+    reconnection_count: int
+    server_switches: int
+    
+    def quality_score(self) -> float:
+        """Calculate overall connection quality score."""
+        # Weight different metrics
+        weights = {
+            'latency': 0.25,
+            'packet_loss': 0.20,
+            'jitter': 0.15,
+            'bandwidth': 0.15,
+            'stability': 0.15,
+            'error_rate': 0.10
+        }
+        
+        # Normalize metrics (lower is better for some, higher for others)
+        latency_score = max(0, 1 - (self.latency_ms / 1000))  # 1000ms = 0 score
+        packet_loss_score = max(0, 1 - self.packet_loss)
+        jitter_score = max(0, 1 - (self.jitter_ms / 100))  # 100ms = 0 score
+        bandwidth_score = min(1, self.bandwidth_mbps / 100)  # 100Mbps = 1 score
+        stability_score = self.connection_stability
+        error_score = max(0, 1 - self.error_rate)
+        
+        return (latency_score * weights['latency'] +
+                packet_loss_score * weights['packet_loss'] +
+                jitter_score * weights['jitter'] +
+                bandwidth_score * weights['bandwidth'] +
+                stability_score * weights['stability'] +
+                error_score * weights['error_rate'])
+
+@dataclass
+class ReconnectionConfig:
+    """Reconnection configuration."""
+    max_attempts: int = 5
+    initial_delay: float = 1.0
+    max_delay: float = 60.0
+    backoff_multiplier: float = 2.0
+    jitter: bool = True
+    enable_exponential_backoff: bool = True
+    enable_server_switching: bool = True
+    server_switch_threshold: int = 3
+    quality_threshold: float = 0.3
+    network_check_interval: float = 5.0
+    connection_timeout: float = 30.0
+    keepalive_interval: float = 30.0
+    keepalive_timeout: float = 10.0
 
 @dataclass
 class ConnectionConfig:
@@ -99,20 +210,27 @@ class ConnectionConfig:
 
 class Connection(LoggableMixin):
     """
-    Represents a connection to a VPN server.
+    Represents a connection to a VPN server with resilience features.
     """
     
-    def __init__(self, config: ConnectionConfig):
+    def __init__(self, config: ConnectionConfig, resilience_config: Optional[Dict[str, Any]] = None):
         """
-        Initialize the connection.
+        Initialize connection.
         
         Args:
             config: The connection configuration.
+            resilience_config: Optional resilience configuration.
         """
         super().__init__()
         
         # Configuration
         self.config = config
+        
+        # Resilience configuration
+        if resilience_config:
+            self.reconnect_config = ReconnectionConfig(**resilience_config.get('reconnection', {}))
+        else:
+            self.reconnect_config = ReconnectionConfig()
         
         # State
         self._state = ConnectionState.DISCONNECTED
@@ -120,14 +238,31 @@ class Connection(LoggableMixin):
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         
-        # Statistics
+        # Enhanced statistics
         self.stats = ConnectionStats()
+        
+        # Resilience state
+        self.reconnection_attempts = 0
+        self.last_reconnection_time = 0.0
+        self.server_switch_count = 0
+        self.network_status = NetworkStatus.UNKNOWN
+        self.connection_metrics: deque = deque(maxlen=1000)
+        self.failure_history: deque = deque(maxlen=100)
+        self.failure_counts: Dict[FailureType, int] = defaultdict(int)
+        
+        # Background tasks
+        self.monitor_thread = None
+        self.keepalive_thread = None
+        self.running = False
         
         # Callbacks
         self._on_connect_callbacks = []
         self._on_disconnect_callbacks = []
         self._on_data_callbacks = []
         self._on_error_callbacks = []
+        self._on_reconnect_callbacks = []
+        self._on_server_switch_callbacks = []
+        self._on_quality_degraded_callbacks = []
         
         self.logger.info(f"Connection initialized to {self.config.server_host}:{self.config.server_port}")
     
@@ -309,15 +444,381 @@ class Connection(LoggableMixin):
                 self.stats.disconnect_time = time.time()
     
     def _handle_error(self, error: Exception) -> None:
-        """Handle an error."""
+        """Handle an error with resilience features."""
         with self._lock:
             self.stats.errors += 1
             self._notify_error(error)
             
+            # Record failure type
+            failure_type = self._classify_error(error)
+            self._record_failure(failure_type, str(error))
+            
             # If we're connected, try to reconnect
-            if self.state == ConnectionState.CONNECTED:
+            if self._state == ConnectionState.CONNECTED:
                 self.logger.warning("Connection error, attempting to reconnect...")
-                self.disconnect()
+                self._start_auto_reconnection()
+    
+    def _classify_error(self, error: Exception) -> FailureType:
+        """Classify error type for resilience handling."""
+        error_str = str(error).lower()
+        
+        if "network" in error_str or "unreachable" in error_str:
+            return FailureType.NETWORK_UNREACHABLE
+        elif "dns" in error_str or "host" in error_str:
+            return FailureType.DNS_FAILURE
+        elif "timeout" in error_str:
+            return FailureType.TIMEOUT
+        elif "connection reset" in error_str:
+            return FailureType.CONNECTION_RESET
+        elif "auth" in error_str or "login" in error_str:
+            return FailureType.AUTHENTICATION_FAILURE
+        else:
+            return FailureType.PROTOCOL_ERROR
+    
+    def _record_failure(self, failure_type: FailureType, message: str = None):
+        """Record a connection failure."""
+        current_time = time.time()
+        
+        # Update failure counts
+        self.failure_counts[failure_type] += 1
+        
+        # Record failure in history
+        failure_record = {
+            'timestamp': current_time,
+            'type': failure_type.name,
+            'message': message,
+            'server': f"{self.config.server_host}:{self.config.server_port}"
+        }
+        
+        self.failure_history.append(failure_record)
+        
+        # Update statistics
+        if failure_type in [FailureType.NETWORK_UNREACHABLE, FailureType.DNS_FAILURE]:
+            self.stats.network_failures += 1
+        
+        self.logger.warning(f"Connection failure recorded: {failure_type.name} - {message}")
+    
+    def _start_auto_reconnection(self):
+        """Start automatic reconnection process."""
+        if self._state in [ConnectionState.RECONNECTING, ConnectionState.CONNECTING]:
+            return
+        
+        self._state = ConnectionState.RECONNECTING
+        self.reconnection_attempts += 1
+        self.last_reconnection_time = time.time()
+        
+        # Trigger reconnection callbacks
+        self._notify_reconnect({
+            'attempt': self.reconnection_attempts,
+            'max_attempts': self.reconnect_config.max_attempts
+        })
+        
+        # Start reconnection in background
+        threading.Thread(target=self._reconnection_loop, daemon=True).start()
+    
+    def _reconnection_loop(self):
+        """Main reconnection loop with exponential backoff."""
+        try:
+            for attempt in range(self.reconnection_attempts, 
+                               self.reconnect_config.max_attempts + 1):
+                
+                self.logger.info(f"Reconnection attempt {attempt}/{self.reconnect_config.max_attempts}")
+                
+                # Calculate delay
+                delay = self._calculate_reconnection_delay(attempt)
+                
+                if delay > 0:
+                    time.sleep(delay)
+                
+                # Check network connectivity first
+                if not self._check_network_connectivity():
+                    self.logger.warning("Network not ready, waiting...")
+                    continue
+                
+                # Attempt reconnection
+                success = self._attempt_reconnection()
+                
+                if success:
+                    self.logger.info(f"Reconnection successful on attempt {attempt}")
+                    self.stats.reconnects += 1
+                    self.reconnection_attempts = 0
+                    return
+                else:
+                    self.logger.warning(f"Reconnection attempt {attempt} failed")
+            
+            # All attempts failed
+            self._state = ConnectionState.FAILED
+            self.logger.error("All reconnection attempts failed")
+            
+        except Exception as e:
+            self.logger.error(f"Reconnection loop error: {e}")
+            self._state = ConnectionState.FAILED
+    
+    def _calculate_reconnection_delay(self, attempt: int) -> float:
+        """Calculate reconnection delay with exponential backoff."""
+        try:
+            if self.reconnect_config.enable_exponential_backoff:
+                delay = self.reconnect_config.initial_delay * (
+                    self.reconnect_config.backoff_multiplier ** (attempt - 1)
+                )
+                delay = min(delay, self.reconnect_config.max_delay)
+            else:
+                delay = self.reconnect_config.initial_delay
+            
+            # Add jitter if enabled
+            if self.reconnect_config.jitter:
+                jitter = random.uniform(0.1, 0.3) * delay
+                delay += jitter
+            
+            return delay
+            
+        except Exception as e:
+            self.logger.error(f"Failed to calculate reconnection delay: {e}")
+            return self.reconnect_config.initial_delay
+    
+    def _attempt_reconnection(self) -> bool:
+        """Attempt to reconnect to the server."""
+        try:
+            # Disconnect first if connected
+            if self._socket:
+                self._cleanup()
+            
+            # Attempt connection
+            return self.connect()
+            
+        except Exception as e:
+            self.logger.error(f"Reconnection attempt failed: {e}")
+            return False
+    
+    def _check_network_connectivity(self) -> bool:
+        """Check network connectivity status."""
+        try:
+            # Test DNS resolution
+            socket.gethostbyname('google.com')
+            
+            # Test internet connectivity
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            result = sock.connect_ex(('8.8.8.8', 53))
+            sock.close()
+            
+            if result == 0:
+                self.network_status = NetworkStatus.HEALTHY
+                return True
+            else:
+                self.network_status = NetworkStatus.DEGRADED
+                return False
+                
+        except Exception as e:
+            self.network_status = NetworkStatus.OFFLINE
+            self.logger.error(f"Network connectivity check failed: {e}")
+            return False
+    
+    def _monitor_connection_quality(self):
+        """Monitor connection quality and trigger actions if needed."""
+        try:
+            if self._state != ConnectionState.CONNECTED:
+                return
+            
+            # Measure current quality metrics
+            metrics = self._measure_connection_quality()
+            
+            if metrics:
+                self.connection_metrics.append(metrics)
+                
+                # Check if quality has degraded significantly
+                if metrics.quality_score() < self.reconnect_config.quality_threshold:
+                    self.logger.warning(f"Connection quality degraded: {metrics.quality_score():.2f}")
+                    
+                    # Trigger quality degraded callbacks
+                    self._notify_quality_degraded({
+                        'current_score': metrics.quality_score(),
+                        'threshold': self.reconnect_config.quality_threshold,
+                        'metrics': metrics
+                    })
+                    
+                    # Consider server switching if enabled
+                    if self.reconnect_config.enable_server_switching:
+                        self._initiate_server_switch()
+            
+        except Exception as e:
+            self.logger.error(f"Connection quality monitoring failed: {e}")
+    
+    def _measure_connection_quality(self) -> Optional[ConnectionMetrics]:
+        """Measure current connection quality metrics."""
+        try:
+            if not self._socket:
+                return None
+            
+            # Measure latency
+            start_time = time.time()
+            
+            # Simple ping test
+            test_data = b'PING'
+            if hasattr(self._socket, 'send'):
+                self._socket.send(test_data)
+                # In a real implementation, we would wait for response
+                # For now, simulate response time
+                time.sleep(0.01)
+                latency = (time.time() - start_time) * 1000
+            else:
+                latency = 0.0
+            
+            # Create metrics
+            metrics = ConnectionMetrics(
+                timestamp=time.time(),
+                latency_ms=latency,
+                packet_loss=0.0,  # Would measure actual packet loss
+                jitter_ms=0.0,   # Would measure actual jitter
+                bandwidth_mbps=0.0,  # Would measure actual bandwidth
+                connection_stability=1.0,
+                error_rate=0.0,
+                uptime_percentage=100.0,
+                reconnection_count=self.reconnection_attempts,
+                server_switches=self.server_switch_count
+            )
+            
+            return metrics
+            
+        except Exception as e:
+            self.logger.error(f"Failed to measure connection quality: {e}")
+            return None
+    
+    def _initiate_server_switch(self):
+        """Initiate server switching (placeholder for integration)."""
+        self.logger.info("Server switching initiated due to quality degradation")
+        self.server_switch_count += 1
+        self.stats.server_switches = self.server_switch_count
+        
+        # Trigger server switch callbacks
+        self._notify_server_switch({
+            'reason': 'quality_degradation',
+            'current_quality': self.stats.quality_score,
+            'switch_count': self.server_switch_count
+        })
+    
+    def _start_monitoring(self):
+        """Start background monitoring threads."""
+        if self.running:
+            return
+        
+        self.running = True
+        
+        # Start quality monitoring thread
+        self.monitor_thread = threading.Thread(target=self._monitoring_worker, daemon=True)
+        self.monitor_thread.start()
+        
+        # Start keepalive thread
+        self.keepalive_thread = threading.Thread(target=self._keepalive_worker, daemon=True)
+        self.keepalive_thread.start()
+        
+        self.logger.info("Started connection monitoring")
+    
+    def _monitoring_worker(self):
+        """Background worker for connection monitoring."""
+        while self.running:
+            try:
+                self._monitor_connection_quality()
+                time.sleep(10)  # Monitor every 10 seconds
+            except Exception as e:
+                self.logger.error(f"Monitoring thread error: {e}")
+                time.sleep(5)
+    
+    def _keepalive_worker(self):
+        """Background worker for keepalive packets."""
+        while self.running:
+            try:
+                if self._state == ConnectionState.CONNECTED and self._socket:
+                    self._send_keepalive()
+                
+                time.sleep(self.reconnect_config.keepalive_interval)
+            except Exception as e:
+                self.logger.error(f"Keepalive thread error: {e}")
+                time.sleep(5)
+    
+    def _send_keepalive(self):
+        """Send keepalive packet to maintain connection."""
+        try:
+            if hasattr(self._socket, 'send'):
+                keepalive_data = b'KEEPALIVE'
+                self._socket.send(keepalive_data)
+                self.stats.last_activity = time.time()
+        except Exception as e:
+            self.logger.error(f"Keepalive failed: {e}")
+            self._handle_error(e)
+    
+    def _notify_reconnect(self, data: Dict[str, Any]):
+        """Notify reconnection callbacks."""
+        for callback in self._on_reconnect_callbacks:
+            try:
+                callback(self, data)
+            except Exception as e:
+                self.logger.error(f"Error in reconnect callback: {e}")
+    
+    def _notify_server_switch(self, data: Dict[str, Any]):
+        """Notify server switch callbacks."""
+        for callback in self._on_server_switch_callbacks:
+            try:
+                callback(self, data)
+            except Exception as e:
+                self.logger.error(f"Error in server switch callback: {e}")
+    
+    def _notify_quality_degraded(self, data: Dict[str, Any]):
+        """Notify quality degraded callbacks."""
+        for callback in self._on_quality_degraded_callbacks:
+            try:
+                callback(self, data)
+            except Exception as e:
+                self.logger.error(f"Error in quality degraded callback: {e}")
+    
+    def add_reconnect_callback(self, callback: Callable[['Connection', Dict[str, Any]], None]) -> None:
+        """Add a callback to be called during reconnection."""
+        with self._lock:
+            self._on_reconnect_callbacks.append(callback)
+    
+    def add_server_switch_callback(self, callback: Callable[['Connection', Dict[str, Any]], None]) -> None:
+        """Add a callback to be called during server switch."""
+        with self._lock:
+            self._on_server_switch_callbacks.append(callback)
+    
+    def add_quality_degraded_callback(self, callback: Callable[['Connection', Dict[str, Any]], None]) -> None:
+        """Add a callback to be called when quality degrades."""
+        with self._lock:
+            self._on_quality_degraded_callbacks.append(callback)
+    
+    def get_connection_quality(self) -> float:
+        """Get current connection quality score."""
+        if self.connection_metrics:
+            recent_metrics = list(self.connection_metrics)[-5:]
+            if recent_metrics:
+                scores = [m.quality_score() for m in recent_metrics]
+                return statistics.mean(scores)
+        return 0.0
+    
+    def get_network_status(self) -> NetworkStatus:
+        """Get current network status."""
+        return self.network_status
+    
+    def get_failure_history(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent failure history."""
+        return list(self.failure_history)[-limit:]
+    
+    def get_connection_metrics(self, hours: int = 1) -> List[ConnectionMetrics]:
+        """Get connection metrics for the specified time period."""
+        cutoff_time = time.time() - (hours * 3600)
+        return [m for m in self.connection_metrics if m.timestamp >= cutoff_time]
+    
+    def stop_monitoring(self):
+        """Stop background monitoring threads."""
+        self.running = False
+        
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=10)
+        
+        if self.keepalive_thread and self.keepalive_thread.is_alive():
+            self.keepalive_thread.join(timeout=10)
+        
+        self.logger.info("Stopped connection monitoring")
     
     def add_connect_callback(self, callback: Callable[['Connection'], None]) -> None:
         """
@@ -620,7 +1121,7 @@ class ConnectionManager(LoggableMixin):
     
     def connect(self) -> bool:
         """
-        Establish a connection to a VPN server.
+        Connect to the server with resilience features.
         
         Returns:
             bool: True if a connection was established, False otherwise.
@@ -636,18 +1137,27 @@ class ConnectionManager(LoggableMixin):
                 return False
             
             self.active_connection = conn
+            
+            # Start monitoring for this connection
+            if hasattr(conn, '_start_monitoring'):
+                conn._start_monitoring()
+            
             return True
     
     def disconnect(self) -> None:
-        """Close the active connection."""
+        """Close the active connection with cleanup."""
         with self._lock:
             if self.active_connection:
+                # Stop monitoring for this connection
+                if hasattr(self.active_connection, 'stop_monitoring'):
+                    self.active_connection.stop_monitoring()
+                
                 self.active_connection.disconnect()
                 self.active_connection = None
     
     def send(self, data: bytes) -> bool:
         """
-        Send data through the active connection.
+        Send data through the active connection with resilience.
         
         Args:
             data: The data to send.
@@ -664,12 +1174,12 @@ class ConnectionManager(LoggableMixin):
                 return self.active_connection.send(data)
             except Exception as e:
                 self.logger.error(f"Failed to send data: {e}", exc_info=True)
-                self.active_connection = None
+                # Don't set active_connection to None here, let resilience handle it
                 return False
     
     def receive(self, timeout: Optional[float] = None) -> Optional[bytes]:
         """
-        Receive data from the active connection.
+        Receive data from the active connection with resilience.
         
         Args:
             timeout: Maximum time to wait for data, in seconds.
@@ -686,8 +1196,49 @@ class ConnectionManager(LoggableMixin):
                 return self.active_connection.receive(timeout)
             except Exception as e:
                 self.logger.error(f"Failed to receive data: {e}", exc_info=True)
-                self.active_connection = None
+                # Don't set active_connection to None here, let resilience handle it
                 return None
+    
+    def get_connection_stats(self) -> Dict[str, Any]:
+        """Get comprehensive connection statistics with resilience metrics."""
+        with self._lock:
+            if not self.active_connection:
+                return {'status': 'no_active_connection'}
+            
+            # Get basic stats
+            stats = {
+                'state': self.active_connection.state.name,
+                'server': f"{self.active_connection.config.server_host}:{self.active_connection.config.server_port}",
+                'bytes_sent': self.active_connection.stats.bytes_sent,
+                'bytes_received': self.active_connection.stats.bytes_received,
+                'packets_sent': self.active_connection.stats.packets_sent,
+                'packets_received': self.active_connection.stats.packets_received,
+                'errors': self.active_connection.stats.errors,
+                'reconnects': self.active_connection.stats.reconnects,
+                'uptime': self.active_connection.stats.uptime,
+                'quality_score': self.active_connection.stats.quality_score,
+                'latency_ms': self.active_connection.stats.latency_ms,
+                'packet_loss': self.active_connection.stats.packet_loss,
+                'server_switches': self.active_connection.stats.server_switches,
+                'network_failures': self.active_connection.stats.network_failures,
+                'network_status': self.active_connection.get_network_status().name if hasattr(self.active_connection, 'get_network_status') else 'unknown'
+            }
+            
+            # Add resilience stats if available
+            if hasattr(self.active_connection, 'get_failure_history'):
+                stats['failure_history'] = self.active_connection.get_failure_history(5)
+            
+            if hasattr(self.active_connection, 'get_connection_metrics'):
+                metrics = self.active_connection.get_connection_metrics(1)  # Last hour
+                if metrics:
+                    stats['recent_metrics'] = [{
+                        'timestamp': m.timestamp,
+                        'quality_score': m.quality_score(),
+                        'latency_ms': m.latency_ms,
+                        'packet_loss': m.packet_loss
+                    } for m in metrics[-10:]]  # Last 10 metrics
+            
+            return stats
     
     def is_connected(self) -> bool:
         """
@@ -701,20 +1252,25 @@ class ConnectionManager(LoggableMixin):
                     self.active_connection.state == ConnectionState.CONNECTED)
     
     def close(self) -> None:
-        """Close all connections and clean up resources."""
+        """Close all connections and clean up resources with monitoring cleanup."""
         with self._lock:
-            self.disconnect()
+            # Stop monitoring for active connection
+            if self.active_connection and hasattr(self.active_connection, 'stop_monitoring'):
+                self.active_connection.stop_monitoring()
+            
             self.pool.close()
 
 
 def main():
-    """Example usage of the ConnectionManager."""
+    """Example usage of enhanced ConnectionManager with resilience features."""
     import argparse
     import json
     
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="VPN Connection Manager")
+    parser = argparse.ArgumentParser(description="Enhanced VPN Connection Manager")
     parser.add_argument("-c", "--config", required=True, help="Path to configuration file")
+    parser.add_argument("--enable-resilience", action="store_true", help="Enable connection resilience features")
+    parser.add_argument("--quality-threshold", type=float, default=0.3, help="Connection quality threshold (0.0-1.0)")
     args = parser.parse_args()
     
     # Load configuration
@@ -731,7 +1287,7 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Create and use the connection manager
+    # Create and use enhanced connection manager
     try:
         # Create a dummy config object
         class Config:
@@ -746,34 +1302,100 @@ def main():
         
         config = Config(config_data)
         
-        # Create the connection manager
+        # Create connection configurations
+        configs = [
+            ConnectionConfig(
+                server_host=config.server_host,
+                server_port=config.server_port,
+                protocol=config.protocol,
+                timeout=10,
+                retry_attempts=3,
+                retry_delay=1.0,
+                max_reconnect_attempts=config.max_reconnect_attempts,
+                reconnect_delay=config.reconnect_delay,
+                keepalive_interval=config.keepalive_interval,
+                buffer_size=65535,
+                mtu=config.mtu,
+                use_compression=True,
+                compression_level=6,
+                use_encryption=True,
+                encryption_key=None
+            )
+        ]
+        
+        # Create connection pool
+        pool = ConnectionPool(configs, pool_size=1)
+        
+        # Create enhanced connection manager
         manager = ConnectionManager(config)
         
-        # Connect to a server
+        # Add resilience callbacks
+        def on_reconnect(conn, data):
+            print(f" Reconnection attempt {data['attempt']}/{data['max_attempts']}")
+        
+        def on_server_switch(conn, data):
+            print(f" Server switch: {data['reason']} (switch #{data['switch_count']})")
+        
+        def on_quality_degraded(conn, data):
+            print(f" Quality degraded: {data['current_score']:.2f} < {data['threshold']:.2f}")
+        
+        # Add callbacks to active connection
+        if hasattr(pool, 'connections') and pool.connections:
+            conn = pool.connections[0]
+            conn.add_reconnect_callback(on_reconnect)
+            conn.add_server_switch_callback(on_server_switch)
+            conn.add_quality_degraded_callback(on_quality_degraded)
+        
+        # Connect to server
+        print(" Connecting to VPN server...")
         if manager.connect():
-            print("Successfully connected to a server!")
+            print(" Successfully connected to server!")
+            
+            # Get connection statistics
+            stats = manager.get_connection_stats()
+            print(f" Connection Stats:")
+            print(f"   Server: {stats.get('server', 'N/A')}")
+            print(f"   State: {stats.get('state', 'N/A')}")
+            print(f"   Quality Score: {stats.get('quality_score', 0):.3f}")
+            print(f"   Network Status: {stats.get('network_status', 'N/A')}")
             
             # Example: Send some data
             if manager.send(b"Hello, server!"):
-                print("Sent data to server")
+                print(" Sent data to server")
             
             # Example: Receive data (with timeout)
             data = manager.receive(timeout=5.0)
             if data:
-                print(f"Received data: {data}")
+                print(f" Received data: {data}")
             else:
-                print("No data received (timeout)")
+                print("  No data received (timeout)")
+            
+            # Monitor connection for a while
+            print(" Monitoring connection for 30 seconds...")
+            import time
+            time.sleep(30)
+            
+            # Get final stats
+            final_stats = manager.get_connection_stats()
+            print(f" Final Stats:")
+            print(f"   Uptime: {final_stats.get('uptime', 0):.2f}s")
+            print(f"   Bytes Sent: {final_stats.get('bytes_sent', 0)}")
+            print(f"   Bytes Received: {final_stats.get('bytes_received', 0)}")
+            print(f"   Reconnects: {final_stats.get('reconnects', 0)}")
+            print(f"   Server Switches: {final_stats.get('server_switches', 0)}")
             
             # Disconnect
             manager.disconnect()
-            print("Disconnected from server")
+            print(" Disconnected from server")
         else:
-            print("Failed to connect to any server")
+            print(" Failed to connect to any server")
         
         return 0
         
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         return 1
 
 
